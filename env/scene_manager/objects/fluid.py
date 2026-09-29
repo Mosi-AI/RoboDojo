@@ -12,6 +12,7 @@ from omni.physx.scripts import particleUtils, physicsUtils
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, Vt
 from scipy.spatial import Delaunay
 import torch
+from env.global_configs import ASSETS_PATH
 
 
 class FluidObject:
@@ -187,7 +188,7 @@ class FluidObject:
         if visual_mdl_path:
             material_url = visual_mdl_path
         else:
-            material_url = "./Assets/Material/Fluid/Linen_Blue.mdl"
+            material_url = os.path.join(ASSETS_PATH, "Material", "Fluid", "Linen_Blue.mdl")
         material_name = os.path.splitext(os.path.basename(material_url))[0]
         looks_path = f"{self.prim_path}/Looks"  # Consistent Looks path
         if is_prim_path_valid(f"{looks_path}/material"):  # Check specific material path

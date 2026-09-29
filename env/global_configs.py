@@ -6,9 +6,17 @@ current_dir = os.path.dirname(current_file)
 ROOT_DIR = os.path.join(current_dir, "..")
 
 BENCHMARK = "RoboDojo"
-ASSETS_PATH = os.path.join(ROOT_DIR, "Assets")
-OBJECTS_PATH = os.path.join(ROOT_DIR, f"Assets/Object/{BENCHMARK}")
-ROBOTS_PATH = os.path.join(ROOT_DIR, "Assets/Robots")
+# RoboICL keeps simulator assets and evaluator output outside the clean
+# RoboDojo checkout.  Keep the upstream-relative defaults for standalone
+# RoboDojo users, while honoring the paths supplied by the shared launcher.
+DATA_ROOT = os.path.abspath(os.environ.get("ROBOICL_DATA_ROOT", os.path.join(ROOT_DIR, "data")))
+ASSETS_PATH = os.path.join(DATA_ROOT, "Assets")
+OBJECTS_PATH = os.path.join(ASSETS_PATH, "Object", BENCHMARK)
+ROBOTS_PATH = os.path.join(ASSETS_PATH, "Robots")
+EVAL_RESULT_PATH = os.path.join(
+    os.environ.get("ROBOICL_RESULTS_ROOT", os.path.join(ROOT_DIR, "results")),
+    "eval_result",
+)
 ENV_CONFIG_PATH = os.path.join(ROOT_DIR, "env_cfg")
 
 ENV_REGEX_NAMESPACE = "{ENV_REGEX_NS}"

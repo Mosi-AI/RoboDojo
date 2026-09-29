@@ -17,6 +17,7 @@ from env.seed_manager.seed_manager import SeedManager
 from utils.cluttered_generator import UnStableError
 from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
+from src.eval_client.ik_continuity import IKContinuityError
 
 
 def _patch_websockets_proxy_compat():
@@ -78,7 +79,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 os.environ["ROBODOJO_RUN_ID"] = run_id
             self.run_id = run_id
             self.save_dir = os.path.join(
-                "eval_result",
+                EVAL_RESULT_PATH,
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
@@ -273,8 +274,16 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 env_idx_list = list(range(self.num_envs))
             if self.physx_monitor_enabled:
                 self._check_endpose_finite(env_idx_list)
-            self.obs_manager.render_for_capture()
-            data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
+            if os.environ.get("ASTRA_VALIDATE_RGB") == "1":
+                # Validate RGB before streaming it.  The readiness helper
+                # performs render-only retries, so a transient blank sensor
+                # frame is never persisted as rollout evidence.
+                from roboicl.policy.camera_readiness import capture
+
+                data = capture(self, env_idx_list)
+            else:
+                self.obs_manager.render_for_capture()
+                data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
             data_list = []
             for env_idx in env_idx_list:
                 if not self.end_flag[env_idx] or last_frame:
@@ -359,6 +368,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
             control_info_list = []
+            # IK validation is side-effect free.  Defer the accepted baseline
+            # update until the control queue accepts the complete batch so a
+            # failure while constructing or queueing a command cannot make an
+            # unexecuted target the continuity reference for the next action.
+            pending_ik_commits = []
+            pending_joint_syncs = []
             if env_idx_list is None:
                 env_idx_list = list(range(self.num_envs))
             for idx, env_idx in enumerate(env_idx_list):
@@ -368,12 +383,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 if self.take_action_cnt[env_idx] == self.step_lim or self.end_flag[env_idx]:
                     continue
 
-                self.take_action_cnt[env_idx] += 1
-                print(
-                    f"env{env_idx} step: \033[92m{self.take_action_cnt[env_idx]} / {self.step_lim}\033[0m",
-                    end="\r",
-                )
                 control_info = dict()
+                ik_guard = getattr(self, 'ik_continuity_guard', None)
+                ik_candidates = {}
+                direct_joint_targets = {}
                 if action_type == "joint":
                     for robot in self.robot_manager.robot_list:
                         if robot.type != "target":
@@ -382,6 +395,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         control_info[key_name] = {
                             "position": action[key_name],
                         }
+                        if ik_guard is not None:
+                            direct_joint_targets[key_name] = action[key_name]
 
                         key_name = self.robot_manager.process_name(robot.gripper_name)
                         if robot.ee_type == "gripper":
@@ -417,6 +432,19 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                             env_idx=env_idx,
                             robot=robot,
                         )
+                        if ik_guard is not None:
+                            ik_candidates[obs_name] = {
+                                'status': ik_result['status'],
+                                'current': self.robot_manager.get_joint(
+                                    robot, env_idx_list=[env_idx])[env_idx],
+                                'target': ik_result.get('joint_value'),
+                                'joint_limits': self.robot_manager.get_joint_limits(
+                                    robot, env_idx_list=[env_idx])[env_idx],
+                                # ARX X5 arm joints are revolute. Keep this
+                                # explicit so a future prismatic arm cannot be
+                                # accidentally treated as periodic.
+                                'periodic': getattr(robot, 'robot_name', None) == 'x5',
+                            }
                         if ik_result["status"] == "Success":
                             control_info[obs_name] = {
                                 "position": ik_result["joint_value"],
@@ -443,11 +471,42 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                             }
                         else:
                             pass
+                if ik_guard is not None and action_type == 'ee':
+                    try:
+                        checks = ik_guard.check(ik_candidates)
+                    except IKContinuityError as exc:
+                        ik_guard.record(self.take_action_cnt[env_idx] + 1,
+                                        exc.checks, accepted=False)
+                        raise
+                    for check in checks:
+                        control_info[check['arm']]['position'] = check['normalized_target_joints']
+                    ik_attempt_step = self.take_action_cnt[env_idx] + 1
+                # Only commands whose interpolation was built successfully
+                # consume an environment step.  IK validation happens before
+                # this point; queue insertion below is the final dispatch
+                # boundary.
                 control_seq = self.process_control_info(control_info, env_idx)
+                self.take_action_cnt[env_idx] += 1
+                print(
+                    f"env{env_idx} step: \033[92m{self.take_action_cnt[env_idx]} / {self.step_lim}\033[0m",
+                    end="\r",
+                )
                 control_info_list.append(control_seq)
+                if ik_guard is not None and action_type == 'joint':
+                    pending_joint_syncs.append((ik_guard, direct_joint_targets))
+                elif ik_guard is not None and action_type == 'ee':
+                    pending_ik_commits.append((ik_guard, ik_attempt_step, checks))
 
             if len(control_info_list) > 0:
                 self.robot_manager.control_manager.push(env_idx_list, control_info_list)
+                # A successful push is the dispatch commit point.  Rejected
+                # proposals were recorded above, but accepted IK targets and
+                # direct-joint recovery holds become baselines only now.
+                for guard, attempt_step, checks in pending_ik_commits:
+                    guard.record(attempt_step, checks, accepted=True)
+                    guard.commit(checks)
+                for guard, targets in pending_joint_syncs:
+                    guard.sync_joint_targets(targets)
                 while not self.have_empty(env_idx_list):
                     self.step(env_idx_list=env_idx_list)
                     if self.physx_monitor_enabled:
@@ -659,7 +718,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             locate by humans.
             """
             return os.path.join(
-                "eval_result",
+                EVAL_RESULT_PATH,
                 f"{BENCHMARK}",
                 self.task_name,
                 self.policy_name,
@@ -769,6 +828,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             return {self.current_env_seed_map[i] for i in env_idxs if i in self.current_env_seed_map}
 
         def run_eval(self):
+            self._scored_policy_failure = None
             self.run_reward()
             if hasattr(self, "get_score"):
                 self.get_score()
@@ -777,10 +837,47 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 if hasattr(self, "query_support_arm_traj"):
                     for env_idx in exist_envs:
                         self.query_support_arm_traj(env_idx=env_idx)
-            if self.eval_batch:
-                self.eval_one_episode_batch()
-            else:
-                self.eval_one_episode()
+            try:
+                if self.eval_batch:
+                    self.eval_one_episode_batch()
+                else:
+                    self.eval_one_episode()
+            except Exception as original_error:
+                # The RoboICL rollout marks policy/RGB failures on the env
+                # before raising.  Preserve the streamed camera evidence at
+                # this boundary; otherwise main.py's generic exception path
+                # advances the seed queue and EvalEnv.close() aborts the
+                # writers, silently deleting the only partial rollout trace.
+                failure = getattr(self, "_policy_failure", None)
+                if not isinstance(failure, dict):
+                    raise original_error
+                finalized = False
+                try:
+                    from roboicl.policy.eval_failure import (
+                        finalize_policy_failure,
+                        preserve_failure,
+                    )
+
+                    # This opt-in path scores an already-eligible healthy
+                    # state without dispatching another action.  All other
+                    # failures retain the partial videos and re-raise.
+                    finalized = finalize_policy_failure(self)
+                    if not finalized:
+                        preserve_failure(self)
+                except Exception as preserve_error:
+                    # Preserve the original policy exception while making a
+                    # best-effort audit attempt.  If preservation itself
+                    # raised, report that fact before the evaluator's normal
+                    # error path.
+                    if preserve_error is not original_error:
+                        print(
+                            "[EvalEnv] failed to preserve policy failure evidence: "
+                            f"{type(preserve_error).__name__}: {preserve_error}",
+                            flush=True,
+                        )
+                    raise original_error
+                if not finalized:
+                    raise original_error
             success = 0
             process_scores = self.reward_manager.get_score() if hasattr(self, "get_score") else None
             # Envs flagged unstable during the episode (e.g. make_kong's
@@ -815,6 +912,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     "success": bool(self.success[env_idx]),
                     "score": episode_score,
                 }
+                if getattr(self, "_scored_policy_failure", None):
+                    self.eval_result["details"][index].update(
+                        interrupted=True,
+                        score_kind="interrupted_current_state",
+                        executed_steps=int(self.take_action_cnt[env_idx]),
+                        policy_error=dict(self._scored_policy_failure),
+                    )
+                    self.eval_result["policy_error"] = dict(self._scored_policy_failure)
                 video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
                 self.save_video(env_idx, video_path, tag)
 
@@ -830,6 +935,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 self.eval_result["score"] = self.total_score / eval_time * 100
             self.eval_result["eval_time"] = eval_time
             save_json(self.eval_result, os.path.join(self.save_dir, "_result.json"))
+            if getattr(self, "_scored_policy_failure", None):
+                report = dict(self._scored_policy_failure)
+                report.update(
+                    scored=True,
+                    score=self.eval_result["score"],
+                    score_kind="interrupted_current_state",
+                )
+                save_json(report, os.path.join(self.save_dir, "_policy_error.json"))
             # Refresh the resume manifest at the end of every batch so that a
             # downstream SIGABRT (which beats the in-process PhysXFatalError
             # handler) still recovers everything up to the previous batch.

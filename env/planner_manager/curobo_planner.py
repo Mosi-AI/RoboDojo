@@ -22,6 +22,39 @@ from utils.transformer import calculate_target_pose
 _curobo_runtime.cuda_graph_reset = True
 
 
+def relocate_robot_asset_paths(kinematics, yml_path):
+    """Resolve robot resources beside the loaded cuRobo YAML.
+
+    Published RoboICL asset manifests may retain the absolute path from the
+    machine that generated ``curobo.yml``.  Resolve that stale prefix against
+    the local robot directory while preserving nested URDF paths; fail early
+    when the referenced file is not present instead of letting cuRobo fail
+    later with an opaque parser error.
+    """
+    from pathlib import Path, PurePosixPath
+
+    local_root = Path(yml_path).absolute().parent
+    old_root = str(kinematics.get("asset_root_path", "")).replace("\\", "/")
+    urdf_value = kinematics.get("urdf_path")
+    if urdf_value:
+        urdf = PurePosixPath(str(urdf_value).replace("\\", "/"))
+        old_prefix = PurePosixPath(old_root) if old_root else None
+        if old_prefix and urdf.is_relative_to(old_prefix):
+            relative = urdf.relative_to(old_prefix)
+        elif not urdf.is_absolute() and not (
+            len(urdf.parts) > 0 and urdf.parts[0].endswith(":")
+        ):
+            relative = urdf
+        else:
+            relative = PurePosixPath(urdf.name)
+        local_urdf = local_root / str(relative)
+        if not local_urdf.is_file():
+            raise FileNotFoundError(f"Robot URDF missing beside {yml_path}: {local_urdf}")
+        kinematics["urdf_path"] = str(local_urdf)
+    kinematics["asset_root_path"] = str(local_root)
+    return kinematics
+
+
 class CuroboPlanner:
     def __init__(
         self,
@@ -425,6 +458,7 @@ class CuroboPlanner:
     def _build_robot_and_scene_cfg(self, yml_data, table_height):
         """Translate a Maniverse-style yml into v2 robot_cfg + scene_model."""
         kinematics = deepcopy(yml_data.get("robot_cfg", {}).get("kinematics", {}))
+        kinematics = relocate_robot_asset_paths(kinematics, self.yml_path)
         ee_link = kinematics.get("ee_link", None)
         tool_frames = kinematics.get("tool_frames", None)
         if tool_frames is None:
