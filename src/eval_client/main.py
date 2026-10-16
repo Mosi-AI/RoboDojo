@@ -65,7 +65,7 @@ args_cli = parser.parse_args()
 
 # Safe to import before AppLauncher: env is a namespace package (no __init__)
 # and GLOBAL_CONFIGS only imports os, so this pulls in no app-dependent code.
-from env.global_configs import BENCHMARK, ROOT_DIR
+from env.global_configs import BENCHMARK, EVAL_RESULT_PATH, ROOT_DIR
 
 task_registry = importlib.import_module(f"task.{BENCHMARK}.task_registry")
 
@@ -152,7 +152,7 @@ def _resume_manifest_path(eval_cfg, run_id):
     the writer and reader paths.
     """
     return os.path.join(
-        "eval_result",
+        EVAL_RESULT_PATH,
         BENCHMARK,
         eval_cfg["task_name"],
         eval_cfg["policy_name"],

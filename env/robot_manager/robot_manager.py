@@ -185,6 +185,22 @@ class RobotManager:
                 results[env_idx] = None
         return results
 
+    def get_joint_limits(self, robot, env_idx_list=None):
+        """Return hard position limits for the selected arm joints."""
+        if env_idx_list is None:
+            env_idx_list = list(range(self.num_envs))
+
+        results = {}
+        key = self.robot_key[self.robot_list.index(robot)]
+        limits = key.data.joint_pos_limits.clone()
+        for env_idx in range(self.num_envs):
+            if env_idx in env_idx_list:
+                selected = deepcopy(limits[env_idx][robot.arm_joint_indices])
+                results[env_idx] = np.array(selected.cpu())
+            else:
+                results[env_idx] = None
+        return results
+
     def get_end_effector_real_val(self, robot, env_idx_list=None):
         if env_idx_list is None:
             env_idx_list = list(range(self.num_envs))
