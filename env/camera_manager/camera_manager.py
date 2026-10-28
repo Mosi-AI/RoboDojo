@@ -453,8 +453,12 @@ class CameraManager:
 
     def get_camera_intrinsics(self, cam_id: int, env_id: int = 0) -> np.ndarray:
         """
-        Return 3x3 intrinsic matrix K for the given camera, computed from config params.
-        Falls back to identity if the camera type has no focal/aperture info (e.g. Kinect USD).
+        Return the 3x3 intrinsic matrix K used by the rendered RGB.
+
+        Omniverse rendering assumes square pixels and currently ignores vertical
+        aperture, matching IsaacLab's camera model.  The Core Camera SDK may
+        report a different fy derived from vertical aperture, which does not
+        describe the rendered image.
         """
         camera_name = self.camera_names[env_id][cam_id]
         camera_cfg = self.camera_config[camera_name]
@@ -472,10 +476,14 @@ class CameraManager:
         Uses get_world_pose so mounted (wrist) cameras are correctly handled.
         Quaternion convention: (w, x, y, z).
         """
-        camera_xform = self.cameras_xform[env_id][cam_id]
-        pos, quat = camera_xform.get_world_pose()
-        pos = pos.cpu().numpy().astype(np.float64)
-        quat = quat.cpu().numpy().astype(np.float64)
+        camera = self.cameras[env_id][cam_id]
+        pos, quat = camera.get_world_pose(camera_axes="usd")
+        if hasattr(pos, "detach"):
+            pos = pos.detach().cpu().numpy()
+        if hasattr(quat, "detach"):
+            quat = quat.detach().cpu().numpy()
+        pos = np.asarray(pos, dtype=np.float64)
+        quat = np.asarray(quat, dtype=np.float64)
         w, x, y, z = quat[0], quat[1], quat[2], quat[3]
         R = np.array(
             [
